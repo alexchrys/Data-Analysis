@@ -1,0 +1,301 @@
+# %%
+import requests
+import pandas as pd
+import json
+import numpy as np
+from ortools.linear_solver import pywraplp
+import os
+
+# %%
+# Step 1: Fetch data from the FPL API
+base_url = "https://fantasy.premierleague.com/api/"
+
+# Fetch player and team data
+response = requests.get(base_url + "bootstrap-static/")
+data = response.json()
+
+# Convert to DataFrame
+elements = pd.DataFrame(data['elements'])
+teams = pd.DataFrame(data['teams'])
+positions = pd.DataFrame(data['element_types'])
+stats = pd.DataFrame(data['element_stats'])
+
+# Define the positions DataFrame
+positions = positions[['id', 'singular_name']]
+
+# Fetch fixtures
+gw_fixtures = requests.get(base_url + "fixtures/").json()
+fixtures = pd.DataFrame(gw_fixtures)
+
+# %%
+elements_clean = elements[['id', 'team', 'web_name', 'element_type', 'now_cost', 'cost_change_event', 'chance_of_playing_next_round', 'event_points', 'form', 'points_per_game', 'team_code', 'total_points', 'minutes', 'goals_scored', 'assists', 'clean_sheets', 'goals_conceded', 'own_goals', 'penalties_saved', 'penalties_missed', 'yellow_cards', 'red_cards', 'saves', 'bonus', 'bps', 'influence', 'creativity', 'threat', 'ict_index', 'starts', 'expected_goals', 'expected_assists', 'expected_goal_involvements', 'expected_goals_conceded', 'mng_win', 'mng_draw', 'mng_loss', 'mng_underdog_win', 'mng_underdog_draw', 'mng_clean_sheets', 'mng_goals_scored', 'expected_goals_per_90', 'saves_per_90', 'expected_assists_per_90', 'expected_goal_involvements_per_90', 'expected_goals_conceded_per_90', 'goals_conceded_per_90', 'starts_per_90', 'clean_sheets_per_90', 'status']]
+
+# %%
+available_players = elements_clean[elements_clean['status']== 'a']
+available_players = available_players[available_players['minutes'] > 300]
+available_players = available_players.merge(teams[['id', 'name']], left_on= 'team', right_on= 'id')
+
+available_players = available_players.rename(columns={'name': 'team_name'})
+
+available_players = available_players.merge(positions, left_on= 'element_type', right_on= 'id')
+
+
+available_players.drop(columns={'id_y', 'status', 'id'}, inplace=True)
+available_players.rename(columns={'id_x': 'player_id', 
+                                  'team':'team_id', 
+                                  'element_type': 'position_id',
+                                  'singular_name': 'position_name'}, inplace=True)
+
+# %%
+median_minutes = available_players['minutes'].median()
+total_gw = max(fixtures[(fixtures['finished'] == True)]['event'])
+cheapest_gk = available_players[available_players['position_name'] == 'Goalkeeper'].nsmallest(1, 'now_cost')['player_id'].values[0]
+
+# %%
+over_performance = available_players[['player_id', 'web_name', 'position_id', 'position_name', 'team_id', 'team_name', 'now_cost', 'minutes',
+                                      'total_points', 'goals_scored', 'assists', 'clean_sheets','goals_conceded', 'cost_change_event',
+                                      'own_goals', 'penalties_saved', 'penalties_missed', 'yellow_cards', 'red_cards', 
+                                      'saves', 'bonus', 'starts', 'ict_index', 'expected_goals', 'expected_assists', 
+                                      'starts_per_90', 'expected_goals_conceded', 'expected_goals_per_90', 'expected_assists_per_90',
+                                      'saves_per_90', 'expected_goals_conceded_per_90', 'goals_conceded_per_90',
+                                      'clean_sheets_per_90']].copy()
+
+cols = over_performance.columns.difference(['web_name', 'position_name', 'team_name'])
+over_performance[cols] = over_performance[cols].apply(pd.to_numeric, errors='coerce', axis=1)
+
+
+conditions = [
+    (over_performance['position_id'] == 1),
+    (over_performance['position_id'] == 2),
+    (over_performance['position_id'] == 3),
+    (over_performance['position_id'] == 4),
+    (over_performance['position_id'] == 5),
+]
+
+conditional_value_goals = [10, 6, 5, 4, 0]
+conditional_value_goals_conceded = [-1, -1, 0, 0, 0]
+conditional_value_saves = [1, 0, 0, 0, 0]
+
+over_performance['goals_per_90'] = np.where(
+    (over_performance['starts_per_90'] > 0.3),
+    round(over_performance['goals_scored'] / over_performance['minutes'] * 90, 2),
+    0
+)
+over_performance['assists_per_90'] = np.where(
+    (over_performance['starts_per_90'] > 0.3),
+    round(over_performance['assists'] / over_performance['minutes'] * 90, 2),
+    0
+)
+over_performance['expected_clean_sheets_per_90'] = np.where(
+    (over_performance['starts_per_90'] >= 0.3),
+    round(np.exp(-over_performance['expected_goals_conceded_per_90']), 2),
+    0
+)
+over_performance['yellow_cards_per_90'] = np.where(
+    (over_performance['starts_per_90'] >= 0.3),
+    round(over_performance['yellow_cards'] / over_performance['minutes'] * 90, 2),
+    0
+)
+over_performance['red_cards_per_90'] = np.where(
+    (over_performance['starts_per_90'] >= 0.3),
+    round(over_performance['red_cards'] / over_performance['minutes'] * 90, 2),
+    0
+)
+over_performance['starts_percentage'] = round(over_performance['starts'] / total_gw , 2)
+
+players_clean = over_performance.assign(
+    points_per_90 = np.where(
+        (over_performance['position_id'] != 5),
+        round((over_performance['total_points'] - over_performance['bonus']) / over_performance['minutes'] * 90, 2),
+        0
+    ),
+    xA_points = over_performance['expected_assists_per_90'] * 3,
+    xG_points = over_performance['expected_goals_per_90'] * np.select(conditions, conditional_value_goals),
+    xGc_points = over_performance['expected_goals_conceded_per_90'] / 2 * np.select(conditions, conditional_value_goals_conceded),
+    xS_points = round(over_performance['saves_per_90'] / 3 * np.select(conditions, conditional_value_saves), 3),
+    xCs_points = over_performance['clean_sheets_per_90'] * 4 * np.select(conditions, conditional_value_saves),
+    xConduct_points = over_performance['yellow_cards_per_90'] + over_performance['red_cards_per_90'] * 2
+)
+
+players_clean['xPoints_per_90'] = players_clean['xA_points'] + players_clean['xCs_points'] + players_clean['xG_points']
++ players_clean['xGc_points'] + players_clean['xS_points'] - players_clean['xConduct_points']
+
+# %%
+def get_fixture_difficulty(team_id, gw):
+    upcoming_fixtures = fixtures[(fixtures['event'] >= gw) & (fixtures['event'] < gw + 5)]
+    team_fixtures = upcoming_fixtures[(upcoming_fixtures['team_h'] == team_id) | (upcoming_fixtures['team_a'] == team_id)]
+    
+    if team_fixtures.empty:
+        return 0,0  # No game means extreme difficulty (avoid blank gameweek players)
+    
+    game_count = len(team_fixtures)
+
+    difficulties = []
+    for _, row in team_fixtures.iterrows():
+        if row['team_h'] == team_id:
+            difficulties.append(row['team_h_difficulty'])
+        else:
+            difficulties.append(row['team_a_difficulty'])
+
+    avg_difficulty = sum(difficulties) / len(difficulties)
+
+    return game_count, avg_difficulty
+
+players_clean[['fixture_count', 'avg_difficulty']] = players_clean['team_id'].apply(
+    lambda x: pd.Series(get_fixture_difficulty(x, total_gw)))
+
+players_clean['adjusted_xPoints_per_90'] = players_clean['xPoints_per_90'] * players_clean['fixture_count'] - (players_clean['avg_difficulty'] - 3) * 0.5
+
+# %%
+# Load previous squad if exists
+squad_file = "selected_squad.csv"
+if os.path.exists(squad_file):
+    selected_players_current_gw = pd.read_csv(squad_file)
+else:
+    selected_players_current_gw = None
+
+# %%
+# Step 3: Optimize Team Selection for Gameweek
+
+solver = pywraplp.Solver.CreateSolver('SCIP')
+player_vars = {p: solver.BoolVar(f'player_{p}') for p in players_clean['player_id']}
+
+# Objective: Maximize total expected points adjusted for performance deviation
+solver.Maximize(solver.Sum(player_vars[p] * (players_clean.loc[players_clean['player_id'] == p, 'points_per_90'].values[0] + 
+                                              players_clean.loc[players_clean['player_id'] == p, 'adjusted_xPoints_per_90'].values[0] +
+                                              0.001 * players_clean.loc[players_clean['player_id'] == p, 'now_cost'].values[0] # +
+                                              #players_clean.loc[players_clean['player_id'] == p, 'fixture_difficulty'].values[0] * 0.4
+                                              )
+                            for p in players_clean['player_id']))
+
+# Objective: Maximize total expected points
+solver.Maximize(solver.Sum(player_vars[p] * players_clean.loc[players_clean['player_id'] == p, 'adjusted_xPoints_per_90'].values[0] for p in players_clean['player_id']))
+
+# Budget constraint
+solver.Add(solver.Sum(player_vars[p] * players_clean.loc[players_clean['player_id'] == p, 'now_cost'].values[0] for p in players_clean['player_id']) <= 1000)
+
+# Position constraints
+for pos, count in zip(['Goalkeeper', 'Defender', 'Midfielder', 'Forward', 'Manager'], [2, 5, 5, 3, 0]):
+    solver.Add(solver.Sum(player_vars[p] for p in players_clean.loc[players_clean['position_name'] == pos, 'player_id']) == count)
+
+# Team constraint (max 3 players per team)
+for team in players_clean['team_name'].unique():
+    solver.Add(solver.Sum(player_vars[p] for p in players_clean.loc[players_clean['team_name'] == team, 'player_id']) <= 3)
+
+solver.Add(
+    solver.Sum(player_vars[p] for p in players_clean.loc[
+        ((players_clean['starts_percentage'] >= 0.7) | (players_clean['player_id'] == cheapest_gk)), 'player_id']) >= 15
+)
+
+solver.Add(solver.Sum(player_vars[p] for p in players_clean.loc[
+    (players_clean['position_name'] == 'Goalkeeper') & (players_clean['player_id'] != cheapest_gk) & (players_clean['starts_per_90'] > 0), 'player_id']) == 1)
+
+# Solve the model
+status = solver.Solve()
+
+
+if status == pywraplp.Solver.OPTIMAL:
+    selected_players_next_gw = players_clean[players_clean['player_id'].isin([p for p in player_vars if player_vars[p].solution_value() == 1])]
+    if selected_players_current_gw is None:
+        selected_players_current_gw = selected_players_next_gw
+        selected_players_current_gw.to_csv(squad_file, index=False)
+    else:
+        selected_players_current_gw = selected_players_next_gw
+        selected_players_current_gw.to_csv(squad_file, index=False)
+
+    print("Selected Players for Current Gameweek: ")
+    print(selected_players_current_gw[['web_name', 'position_id', 'position_name', 'team_name', 'now_cost', 'adjusted_xPoints_per_90']].sort_values('position_id', ascending=True))
+else:
+    print("No optimal solution found")
+
+# %%
+# Step 4: Optimize Transfers for next gameweek
+best_transfer = None
+best_team = None
+best_score = -float('inf')
+
+# Identify the backup goalkeeper (cheapest one) to ignore in transfers
+backup_gk_id = selected_players_current_gw[(selected_players_current_gw['position_name'] == 'Goalkeeper')].nsmallest(1, 'now_cost')['player_id'].values[0]
+
+for i, player_out in selected_players_current_gw.iterrows():
+    #Ignore the transfer of the backup goalie
+    if player_out['player_id'] == backup_gk_id:
+        continue
+
+    for j, player_in in players_clean.iterrows():
+        if (player_in['player_id'] in selected_players_current_gw['player_id'].values or 
+            player_out['position_id'] != player_in['position_id'] or
+            (selected_players_current_gw[selected_players_current_gw['team_name'] == player_in['team_name']].shape[0] >= 3 and player_out['team_name'] != player_in['team_name'])):
+            continue
+        
+        temp_team = selected_players_current_gw.copy()
+        temp_team.loc[temp_team['player_id'] == player_out['player_id'], temp_team.columns] = player_in[temp_team.columns].values
+        
+        points_per_90 = temp_team['points_per_90'].sum()
+        total_cost = temp_team['now_cost'].sum()
+        difficulty_rating = sum(
+            fixtures[(fixtures['team_h'] == team_id)]['team_h_difficulty'].sum() +
+            fixtures[(fixtures['team_a'] == team_id)]['team_a_difficulty'].sum()
+            for team_id in temp_team['team_name']
+        )
+        
+        score = points_per_90 - 0.5 * difficulty_rating + temp_team['adjusted_xPoints_per_90'].sum()
+        
+        if total_cost <= 1000 and score > best_score:
+            best_score = score
+            best_transfer = (player_out['web_name'], player_in['web_name'])
+            best_team = temp_team.copy().sort_values(by='position_id')
+
+if best_transfer:
+    print(f"Best transfer: {best_transfer[0]} out, {best_transfer[1]} in")
+    print("Selected Players for next Gameweek:")
+    print(best_team[['web_name', 'position_name', 'team_name', 'now_cost', 'adjusted_xPoints_per_90']])
+else:
+    print("No optimal transfer found.")
+
+# %%
+# Redo Step 4 but with more than one transfer allowed
+best_transfers = []
+best_team = selected_players_current_gw.copy()
+current_score = best_team['adjusted_xPoints_per_90'].sum()
+already_transferred_in = set()  # Track players already transferred in
+
+for i, player_out in selected_players_current_gw.iterrows():
+    if player_out['player_id'] == backup_gk_id:  # Ignore transfers involving the backup GK
+        continue
+
+    for j, player_in in players_clean.iterrows():
+        if (player_in['player_id'] in selected_players_current_gw['player_id'].values or 
+            player_out['position_id'] != player_in['position_id'] or 
+            player_in['team_name'] == player_out['team_name'] or  # Prevent same-team swaps
+            player_in['player_id'] in already_transferred_in or  # Prevent duplicate transfers
+            (selected_players_current_gw[selected_players_current_gw['team_name'] == player_in['team_name']].shape[0] >= 3 and player_out['team_name'] != player_in['team_name'])):
+            continue
+
+        temp_team = best_team.copy()
+        temp_team.loc[temp_team['player_id'] == player_out['player_id'], temp_team.columns] = player_in[temp_team.columns].values
+
+        points_per_90 = temp_team['points_per_90'].sum()
+        total_cost = temp_team['now_cost'].sum()
+        difficulty_rating = sum(
+            fixtures[(fixtures['team_h'] == team_id)]['team_h_difficulty'].sum() +
+            fixtures[(fixtures['team_a'] == team_id)]['team_a_difficulty'].sum()
+            for team_id in temp_team['team_name']
+        )
+        penalty = max(0, (len(best_transfers)) * 4)  # Extra transfers beyond 1 incur penalty
+
+        score = points_per_90 - 0.5 * difficulty_rating + temp_team['adjusted_xPoints_per_90'].sum()
+
+        if total_cost <= 1000 and (score - penalty) > current_score:
+            current_score = score - penalty
+            best_transfers.append((player_out['web_name'], player_in['web_name']))
+            already_transferred_in.add(player_in['player_id'])  # Mark player as transferred in
+            best_team = temp_team.copy().sort_values(by='position_id')
+
+if best_transfers:
+    for transfer in best_transfers:
+        print(f"Transfer: {transfer[0]} out, {transfer[1]} in")
+    print("Final Selected Players for next Gameweek:")
+    print(best_team[['web_name', 'position_name', 'team_name', 'now_cost', 'adjusted_xPoints_per_90']])
+else:
+    print("No transfers made. Current team remains optimal.")
